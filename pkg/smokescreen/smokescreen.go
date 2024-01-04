@@ -290,16 +290,17 @@ func dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	}
 
 	if sctx.cfg.TimeConnect {
-		sctx.cfg.MetricsClient.TimingWithTags("cn.atpt.connect.time", connTime, map[string]string{"domain": sctx.requestedHost}, 1)
+		domainTag := fmt.Sprintf("domain:%s", sctx.requestedHost)
+		sctx.cfg.MetricsClient.TimingWithTags("cn.atpt.connect.time", connTime, 1, []string{domainTag})
 	}
 
 	if err != nil {
-		sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", map[string]string{"success": "false"}, 1)
+		sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", []string{"success:false"}, 1)
 		sctx.cfg.ConnTracker.RecordAttempt(sctx.requestedHost, false)
 		metrics.ReportConnError(sctx.cfg.MetricsClient, err)
 		return nil, err
 	}
-	sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", map[string]string{"success": "true"}, 1)
+	sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", []string{"success:true"}, 1)
 	sctx.cfg.ConnTracker.RecordAttempt(sctx.requestedHost, true)
 
 	if conn != nil {
@@ -922,10 +923,10 @@ func checkACLsForRequest(config *Config, req *http.Request, destination hostport
 		return decision
 	}
 
-	tags := map[string]string{
-		"role":     decision.role,
-		"def_rule": fmt.Sprintf("%t", aclDecision.Default),
-		"project":  aclDecision.Project,
+	tags := []string{
+		fmt.Sprintf("role:%s", decision.role),
+		fmt.Sprintf("def_rule:%t", aclDecision.Default),
+		fmt.Sprintf("project:%s", aclDecision.Project),
 	}
 
 	switch aclDecision.Result {

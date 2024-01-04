@@ -2,6 +2,7 @@ package conntrack
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -92,8 +93,8 @@ func (ic *InstrumentedConn) Close() error {
 	end := time.Now()
 	duration := end.Sub(ic.Start).Seconds()
 
-	tags := map[string]string{
-		"role": ic.Role,
+	tags := []string{
+		fmt.Sprintf("role:%s", ic.Role),
 	}
 
 	ic.tracker.statsc.IncrWithTags("cn.close", tags, 1)
