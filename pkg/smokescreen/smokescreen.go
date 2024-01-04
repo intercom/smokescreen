@@ -433,7 +433,7 @@ func newContext(cfg *Config, proxyType string, req *http.Request) *SmokescreenCo
 }
 
 func BuildProxy(config *Config) *goproxy.ProxyHttpServer {
-	proxy := goproxy.NewProxyHttpServer(goproxy.WithHttpProxyAddr(config.TransportHttpProxyAddr), goproxy.WithHttpsProxyAddr(config.TransportHttpsProxyAddr))
+	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = false
 	configureTransport(proxy.Tr, config)
 
