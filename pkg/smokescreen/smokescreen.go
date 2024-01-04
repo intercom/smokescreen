@@ -541,12 +541,9 @@ func BuildProxy(config *Config) *goproxy.ProxyHttpServer {
 	proxy.OnResponse().DoFunc(func(resp *http.Response, pctx *goproxy.ProxyCtx) *http.Response {
 		sctx := pctx.UserData.(*smokescreenContext)
 
-		if resp != nil && pctx.Error == nil && sctx.decision.allow {
-			if resp.Header.Get(errorHeader) != "" {
+		if resp != nil && resp.Header.Get(errorHeader) != "" {
+			if pctx.Error == nil && sctx.decision.allow {
 				resp.Header.Del(errorHeader)
-			}
-			if sctx.cfg.AcceptResponseHandler != nil {
-				sctx.cfg.AcceptResponseHandler(resp)
 			}
 		}
 
