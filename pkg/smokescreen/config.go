@@ -73,9 +73,9 @@ type Config struct {
 	TransportMaxIdleConns        int
 	TransportMaxIdleConnsPerHost int
 
-	// These are the http and https address for the upstream proxy 
-	UpstreamHttpProxyAddr  string
-	UpstreamHttpsProxyAddr string
+	// There are the http and https address for the transport proxy
+	TransportHttpProxyAddr  string
+	TransportHttpsProxyAddr string
 
 	// Used for logging connection time
 	TimeConnect bool
