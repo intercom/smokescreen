@@ -356,11 +356,6 @@ func rejectResponse(pctx *goproxy.ProxyCtx, err error) *http.Response {
 			status = "Gateway timeout"
 			code = http.StatusGatewayTimeout
 			msg = "Timed out connecting to remote host: " + e.Error()
-
-		} else if e, ok := err.(*net.DNSError); ok {
-			status = "Bad gateway"
-			code = http.StatusBadGateway
-			msg = "Failed to resolve remote hostname: " + e.Error()
 		} else {
 			status = "Bad gateway"
 			code = http.StatusBadGateway
@@ -625,13 +620,9 @@ func handleConnect(config *Config, pctx *goproxy.ProxyCtx) (string, error) {
 		pctx.Error = denyError{err}
 		return "", pctx.Error
 	}
-
-	// checkIfRequestShouldBeProxied can return an error if either the resolved address is disallowed,
-	// or if there is a DNS resolution failure.
 	sctx.decision, sctx.lookupTime, pctx.Error = checkIfRequestShouldBeProxied(config, pctx.Req, destination)
 	if pctx.Error != nil {
-		// DNS resolution failure
-		return "", pctx.Error
+		return "", denyError{pctx.Error}
 	}
 	if !sctx.decision.allow {
 		return "", denyError{errors.New(sctx.decision.reason)}

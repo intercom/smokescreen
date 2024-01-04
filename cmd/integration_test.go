@@ -441,7 +441,7 @@ func validateProxyResponseWithUpstream(t *testing.T, test *TestCase, resp *http.
 	t.Logf("HTTP Response: %#v", resp)
 
 	if test.OverConnect {
-		a.Contains(err.Error(), "Failed to resolve remote hostname")
+		a.Contains(err.Error(), "Failed to connect to remote host")
 	} else {
 		a.Equal(http.StatusBadGateway, resp.StatusCode)
 	}
