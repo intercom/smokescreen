@@ -89,9 +89,8 @@ type Config struct {
 
 	// Custom handler for users to allow running code per requests, users can pass in custom methods to verify requests based
 	// on headers, code for metrics etc.
-	// If smokescreen denies a request, this handler is not called.
 	// If the handler returns an error, smokescreen will deny the request.
-	PostDecisionRequestHandler func(*http.Request) error
+	CustomRequestHandler func(*http.Request) error
 }
 
 type missingRoleError struct {
