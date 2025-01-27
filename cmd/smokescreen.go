@@ -85,6 +85,25 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			Name:  "egress-acl-file",
 			Usage: "Validate egress traffic against `FILE`",
 		},
+		cli.BoolFlag{
+			Name:  "expose-prometheus-metrics",
+			Usage: "Expose metrics via prometheus.",
+		},
+		cli.StringFlag{
+			Name:  "prometheus-endpoint",
+			Value: "/metrics",
+			Usage: "Expose prometheus metrics on `ENDPOINT`. Requires --expose-prometheus-metrics to be set. Defaults to \"/metrics\"",
+		},
+		cli.StringFlag{
+			Name: "prometheus-listen-ip",
+			Value: "0.0.0.0",
+			Usage: "Listen for prometheus metrics on interface with address IP. Requires --expose-prometheus-metrics to be set. Defaults to \"0.0.0.0\"",
+		},
+		cli.StringFlag{
+			Name:  "prometheus-port",
+			Value: "9810",
+			Usage: "Expose prometheus metrics on `PORT`. Requires --expose-prometheus-metrics to be set. Defaults to \"9810\"",
+		},
 		cli.StringSliceFlag{
 			Name:  "resolver-address",
 			Usage: "Make DNS requests to `ADDRESS` (IP:port).  Repeatable.",
@@ -126,6 +145,16 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 		cli.BoolFlag{
 			Name:  "unsafe-allow-private-ranges",
 			Usage: "Allow private ip ranges by default",
+		},
+		cli.StringFlag{
+			Name:  "upstream-http-proxy-addr",
+			Value: "",
+			Usage: "Set Smokescreen's upstream HTTP proxy address",
+		},
+		cli.StringFlag{
+			Name:  "upstream-https-proxy-addr",
+			Value: "",
+			Usage: "Set Smokescreen's upstream HTTPS proxy address",
 		},
 	}
 
@@ -229,6 +258,12 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			}
 		}
 
+		if c.IsSet("expose-prometheus-metrics") {
+			if err := conf.SetupPrometheus(c.String("prometheus-endpoint"), c.String("prometheus-port"), c.String("prometheus-listen-ip")); err != nil {
+				return err
+			}
+		}
+
 		if c.IsSet("egress-acl-file") {
 			if err := conf.SetupEgressAcl(c.String("egress-acl-file")); err != nil {
 				return err
@@ -260,6 +295,14 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 				c.StringSlice("tls-client-ca-file")); err != nil {
 				return err
 			}
+		}
+
+		if c.IsSet("upstream-http-proxy-addr") {
+			conf.UpstreamHttpProxyAddr = c.String("upstream-http-proxy-addr")
+		}
+
+		if c.IsSet("upstream-https-proxy-addr") {
+			conf.UpstreamHttpsProxyAddr = c.String("upstream-https-proxy-addr")
 		}
 
 		// Setup the connection tracker if there is not yet one in the config

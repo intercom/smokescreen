@@ -6,6 +6,7 @@ package smokescreen
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stripe/goproxy"
 	"github.com/stripe/smokescreen/pkg/smokescreen/conntrack"
 	"github.com/stripe/smokescreen/pkg/smokescreen/metrics"
 )
@@ -175,7 +178,9 @@ func TestClearsErrorHeader(t *testing.T) {
 	t.Run("Clears error header set by upstream", func(t *testing.T) {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-		cfg, err := testConfig("test-trusted-srv")
+		cfg, err := testConfig("test-local-srv")
+		r.NoError(err)
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
 		r.NoError(err)
 
 		proxySrv := proxyServer(cfg)
@@ -186,9 +191,17 @@ func TestClearsErrorHeader(t *testing.T) {
 		client, err := proxyClient(proxySrv.URL)
 		r.NoError(err)
 
+		// Create a test http.TestServer to serve a response with the error header set.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set(errorHeader, "foobar")
+			w.Header().Set("X-Smokescreen-Test", "yes")
+			w.WriteHeader(200)
+		}))
+		defer srv.Close()
+
 		// Talk "through" the proxy to our malicious upstream that sets the
 		// error header.
-		resp, err := client.Get("http://httpbin.org/response-headers?X-Smokescreen-Error=foobar&X-Smokescreen-Test=yes")
+		resp, err := client.Get(srv.URL)
 		r.NoError(err)
 
 		// Should succeed
@@ -396,11 +409,10 @@ func TestHealthcheck(t *testing.T) {
 
 var invalidHostCases = []struct {
 	scheme    string
-	expectErr bool
 	proxyType string
 }{
-	{"http", false, "http"},
-	{"https", true, "connect"},
+	{"http", "http"},
+	{"https", "connect"},
 }
 
 func TestInvalidHost(t *testing.T) {
@@ -420,12 +432,19 @@ func TestInvalidHost(t *testing.T) {
 			client, err := proxyClient(proxySrv.URL)
 			r.NoError(err)
 
+			// This hostname does not exist and should never resolve
 			resp, err := client.Get(fmt.Sprintf("%s://notarealhost.test", testCase.scheme))
-			if testCase.expectErr {
-				r.Contains(err.Error(), "Request rejected by proxy")
+			if testCase.scheme == "https" {
+				r.Error(err)
+				r.Contains(err.Error(), "Bad gateway")
 			} else {
+				// Plain HTTP
 				r.NoError(err)
 				r.Equal(http.StatusBadGateway, resp.StatusCode)
+
+				defer resp.Body.Close()
+				b, _ := ioutil.ReadAll(resp.Body)
+				r.Contains(string(b), "Failed to resolve remote hostname")
 			}
 
 			entry := findCanonicalProxyDecision(logHook.AllEntries())
@@ -565,13 +584,13 @@ func TestProxyProtocols(t *testing.T) {
 		// DNS request along with its timing metric.
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:true")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "true"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		lookups, err := tmc.GetCount("resolver.attempts_total")
+		lookups, err := tmc.GetCount("resolver.attempts_total", make(map[string]string))
 		r.NoError(err)
 		r.Equal(lookups, uint64(1))
-		ltime, err := tmc.GetCount("resolver.lookup_time")
+		ltime, err := tmc.GetCount("resolver.lookup_time", make(map[string]string))
 		r.NoError(err)
 		r.Equal(ltime, uint64(1))
 
@@ -629,13 +648,13 @@ func TestProxyProtocols(t *testing.T) {
 		// DNS request along with its timing metric.
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:true")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "true"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		lookups, err := tmc.GetCount("resolver.attempts_total")
+		lookups, err := tmc.GetCount("resolver.attempts_total", make(map[string]string))
 		r.NoError(err)
 		r.Equal(lookups, uint64(1))
-		ltime, err := tmc.GetCount("resolver.lookup_time")
+		ltime, err := tmc.GetCount("resolver.lookup_time", make(map[string]string))
 		r.NoError(err)
 		r.Equal(ltime, uint64(1))
 
@@ -691,7 +710,7 @@ func TestProxyTimeouts(t *testing.T) {
 	// for an EOF returned from HTTP client to indicate a connection interruption
 	// which in our case represents the timeout.
 	//
-	// To correctly hook into this, we'd need to pass a logger from Smokescreen to Goproxy
+	// To correctly hook into this, we'd need to pass a Logger from Smokescreen to Goproxy
 	// which we have hooks into. This would be able to verify the timeout as errors from
 	// each end of the connection pair are logged by Goproxy.
 	t.Run("CONNECT proxy timeouts", func(t *testing.T) {
@@ -726,7 +745,7 @@ func TestProxyTimeouts(t *testing.T) {
 		// timeouts to Smokescreen; same reasons we test for EOF above.
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:true")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "true"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
 
@@ -762,10 +781,10 @@ func TestProxyTimeouts(t *testing.T) {
 
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:false")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "false"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		i, err = tmc.GetCount("cn.atpt.connect.err", "type:timeout")
+		i, err = tmc.GetCount("cn.atpt.connect.err", map[string]string{"type": "timeout"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
 	})
@@ -837,10 +856,10 @@ func TestProxyConnectFailure(t *testing.T) {
 
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:false")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "false"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		i, err = tmc.GetCount("cn.atpt.connect.err", "type:refused")
+		i, err = tmc.GetCount("cn.atpt.connect.err", map[string]string{"type": "refused"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
 	})
@@ -903,7 +922,7 @@ func TestProxyHalfClosed(t *testing.T) {
 
 	tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 	r.True(ok)
-	i, err := tmc.GetCount("cn.atpt.total", "success:true")
+	i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "true"})
 	r.NoError(err)
 	r.Equal(i, uint64(1))
 
@@ -953,10 +972,10 @@ func TestCustomDialTimeout(t *testing.T) {
 
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:false")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "false"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		i, err = tmc.GetCount("cn.atpt.connect.err", "type:timeout")
+		i, err = tmc.GetCount("cn.atpt.connect.err", map[string]string{"type": "timeout"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
 	})
@@ -995,10 +1014,10 @@ func TestCustomDialTimeout(t *testing.T) {
 
 		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
 		r.True(ok)
-		i, err := tmc.GetCount("cn.atpt.total", "success:false")
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "false"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
-		i, err = tmc.GetCount("cn.atpt.connect.err", "type:timeout")
+		i, err = tmc.GetCount("cn.atpt.connect.err", map[string]string{"type": "timeout"})
 		r.NoError(err)
 		r.Equal(i, uint64(1))
 
@@ -1048,6 +1067,91 @@ func TestRejectResponseHandler(t *testing.T) {
 	})
 }
 
+func TestRejectResponseHandlerWithCtx(t *testing.T) {
+	r := require.New(t)
+	testHeader := "TestRejectResponseHandlerWithCtxHeader"
+	t.Run("Testing custom reject response handler", func(t *testing.T) {
+		cfg, err := testConfig("test-local-srv")
+
+		// set a custom RejectResponseHandler that will set a header on every reject response
+		cfg.RejectResponseHandlerWithCtx = func(_ *SmokescreenContext, resp *http.Response) {
+			resp.Header.Set(testHeader, "This header is added by the RejectResponseHandlerWithCtx")
+		}
+		r.NoError(err)
+
+		proxySrv := proxyServer(cfg)
+		r.NoError(err)
+		defer proxySrv.Close()
+
+		// Create a http.Client that uses our proxy
+		client, err := proxyClient(proxySrv.URL)
+		r.NoError(err)
+
+		// Send a request that should be blocked
+		resp, err := client.Get("http://127.0.0.1")
+		r.NoError(err)
+
+		// The RejectResponseHandlerWithCtx should set our custom header
+		h := resp.Header.Get(testHeader)
+		if h == "" {
+			t.Errorf("Expecting header %s to be set by RejectResponseHandler", testHeader)
+		}
+		// Send a request that should be allowed
+		resp, err = client.Get("http://example.com")
+		r.NoError(err)
+
+		// The header set by our custom reject response handler should not be set
+		h = resp.Header.Get(testHeader)
+		if h != "" {
+			t.Errorf("Expecting header %s to not be set by RejectResponseHandler", testHeader)
+		}
+	})
+}
+
+// Test that Smokescreen calls the custom accept response handler (if defined in the Config struct)
+// after every accepted request
+func TestAcceptResponseHandler(t *testing.T) {
+	r := require.New(t)
+	testHeader := "TestAcceptResponseHandlerHeader"
+	t.Run("Testing custom accept response handler", func(t *testing.T) {
+		cfg, err := testConfig("test-local-srv")
+
+		// set a custom AcceptResponseHandler that will set a header on every reject response
+		cfg.AcceptResponseHandler = func(_ *SmokescreenContext, resp *http.Response) error {
+			resp.Header.Set(testHeader, "This header is added by the AcceptResponseHandler")
+			return nil
+		}
+		r.NoError(err)
+
+		proxySrv := proxyServer(cfg)
+		r.NoError(err)
+		defer proxySrv.Close()
+
+		// Create a http.Client that uses our proxy
+		client, err := proxyClient(proxySrv.URL)
+		r.NoError(err)
+
+		// Send a request that should be allowed
+		resp, err := client.Get("http://example.com")
+		r.NoError(err)
+
+		// The AcceptResponseHandler should set our custom header
+		h := resp.Header.Get(testHeader)
+		if h == "" {
+			t.Errorf("Expecting header %s to be set by AcceptResponseHandler", testHeader)
+		}
+		// Send a request that should be blocked
+		resp, err = client.Get("http://127.0.0.1")
+		r.NoError(err)
+
+		// The header set by our custom reject response handler should not be set
+		h = resp.Header.Get(testHeader)
+		if h != "" {
+			t.Errorf("Expecting header %s to not be set by AcceptResponseHandler", testHeader)
+		}
+	})
+}
+
 func TestCustomRequestHandler(t *testing.T) {
 	r := require.New(t)
 	testHeader := "X-Verify-Request-Header"
@@ -1070,7 +1174,7 @@ func TestCustomRequestHandler(t *testing.T) {
 		return nil
 	}
 
-	t.Run("CustomRequestHandler works for HTTPS", func(t *testing.T) {
+	t.Run("PostDecisionRequestHandler works for HTTPS", func(t *testing.T) {
 		testCases := []struct {
 			header        http.Header
 			expectedError bool
@@ -1088,7 +1192,7 @@ func TestCustomRequestHandler(t *testing.T) {
 		r.NoError(err)
 		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
 		r.NoError(err)
-		cfg.CustomRequestHandler = customRequestHandler
+		cfg.PostDecisionRequestHandler = customRequestHandler
 
 		l, err := net.Listen("tcp", "localhost:0")
 		r.NoError(err)
@@ -1119,7 +1223,7 @@ func TestCustomRequestHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("CustomRequestHandler works for HTTP", func(t *testing.T) {
+	t.Run("PostDecisionRequestHandler works for HTTP", func(t *testing.T) {
 		testCases := []struct {
 			header        string
 			expectedError bool
@@ -1137,7 +1241,7 @@ func TestCustomRequestHandler(t *testing.T) {
 		r.NoError(err)
 		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
 		r.NoError(err)
-		cfg.CustomRequestHandler = customRequestHandler
+		cfg.PostDecisionRequestHandler = customRequestHandler
 
 		l, err := net.Listen("tcp", "localhost:0")
 		r.NoError(err)
@@ -1173,6 +1277,293 @@ func TestCustomRequestHandler(t *testing.T) {
 
 			}
 		}
+	})
+}
+
+func TestCONNECTProxyACLs(t *testing.T) {
+	t.Run("Blocks a non-approved proxy when the X-Upstream-Https-Proxy header is set", func(t *testing.T) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("OK"))
+		})
+		r := require.New(t)
+		l, err := net.Listen("tcp", "localhost:0")
+		r.NoError(err)
+		cfg, err := testConfig("test-external-connect-proxy-blocked-srv")
+		r.NoError(err)
+		cfg.Listener = l
+
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
+		r.NoError(err)
+
+		internalToStripeProxy := proxyServer(cfg)
+		logHook := proxyLogHook(cfg)
+		remote := httptest.NewTLSServer(h)
+
+		client, err := proxyClientWithConnectHeaders(internalToStripeProxy.URL, http.Header{"X-Upstream-Https-Proxy": []string{"https://google.com"}})
+		r.NoError(err)
+
+		req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		client.Do(req)
+
+		entry := findCanonicalProxyDecision(logHook.AllEntries())
+		r.NotNil(entry)
+		r.Equal("connect proxy host not allowed in rule", entry.Data["decision_reason"])
+		r.Equal("test-external-connect-proxy-blocked-srv", entry.Data["role"])
+		r.Equal(false, entry.Data["allow"])
+	})
+
+	t.Run("Blocks if proxy can't be parsed when the X-Upstream-Https-Proxy header is set", func(t *testing.T) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("OK"))
+		})
+		r := require.New(t)
+		l, err := net.Listen("tcp", "localhost:0")
+		r.NoError(err)
+		cfg, err := testConfig("test-external-connect-proxy-blocked-srv")
+		r.NoError(err)
+		cfg.Listener = l
+
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
+		r.NoError(err)
+
+		internalToStripeProxy := proxyServer(cfg)
+		remote := httptest.NewTLSServer(h)
+
+		client, err := proxyClientWithConnectHeaders(internalToStripeProxy.URL, http.Header{"X-Upstream-Https-Proxy": []string{"google.com"}})
+		r.NoError(err)
+
+		req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		_, err = client.Do(req)
+		r.Error(err)
+		r.Contains(err.Error(), "Request rejected by proxy")
+	})
+
+	t.Run("Allows an approved proxy when the X-Upstream-Https-Proxy header is set", func(t *testing.T) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("OK"))
+		})
+		r := require.New(t)
+		l, err := net.Listen("tcp", "localhost:0")
+		r.NoError(err)
+		cfg, err := testConfig("test-external-connect-proxy-allowed-srv")
+		r.NoError(err)
+		cfg.Listener = l
+
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
+		r.NoError(err)
+
+		proxy := proxyServer(cfg)
+		logHook := proxyLogHook(cfg)
+
+		// The External proxy is a HTTPS proxy that will be used to connect to the remote server
+		externalProxy := httptest.NewUnstartedServer(BuildProxy(cfg))
+		externalProxy.StartTLS()
+
+		remote := httptest.NewTLSServer(h)
+		client, err := proxyClientWithConnectHeaders(
+			proxy.URL,
+			http.Header{
+				"X-Upstream-Https-Proxy": []string{"https://param1_username-param2-param3:password@myproxy.com:12345"},
+			},
+		)
+		r.NoError(err)
+
+		req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		client.Do(req)
+
+		entry := findCanonicalProxyDecision(logHook.AllEntries())
+		r.NotNil(entry)
+		r.Equal("host matched allowed domain in rule", entry.Data["decision_reason"])
+		r.Equal("test-external-connect-proxy-allowed-srv", entry.Data["role"])
+		r.Equal(true, entry.Data["allow"])
+	})
+
+	t.Run("Allows multiple approved proxies when the X-Upstream-Https-Proxy header is set", func(t *testing.T) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("OK"))
+		})
+		r := require.New(t)
+		l, err := net.Listen("tcp", "localhost:0")
+		r.NoError(err)
+		cfg, err := testConfig("test-external-connect-proxy-allowed-srv")
+		r.NoError(err)
+		cfg.Listener = l
+
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
+		r.NoError(err)
+
+		proxy := proxyServer(cfg)
+		logHook := proxyLogHook(cfg)
+
+		// The External proxy is a HTTPS proxy that will be used to connect to the remote server
+		externalProxy := httptest.NewUnstartedServer(BuildProxy(cfg))
+		externalProxy.StartTLS()
+
+		remote := httptest.NewTLSServer(h)
+		first_client, err := proxyClientWithConnectHeaders(proxy.URL, http.Header{"X-Upstream-Https-Proxy": []string{"https://myproxy.com"}})
+		r.NoError(err)
+
+		first_req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		first_client.Do(first_req)
+
+		second_client, err := proxyClientWithConnectHeaders(proxy.URL, http.Header{"X-Upstream-Https-Proxy": []string{"https://myproxy2.com"}})
+		r.NoError(err)
+
+		second_req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		second_client.Do(second_req)
+
+		entries := logHook.AllEntries()
+		r.Equal(2, len(entries))
+
+		first_entry := entries[0]
+		second_entry := entries[1]
+		r.Equal("host matched allowed domain in rule", first_entry.Data["decision_reason"])
+		r.Equal("host matched allowed domain in rule", second_entry.Data["decision_reason"])
+	})
+}
+
+func TestMitm(t *testing.T) {
+	t.Run("CONNECT proxy", func(t *testing.T) {
+		a := assert.New(t)
+		r := require.New(t)
+
+		cfg, err := testConfig("test-mitm")
+		r.NoError(err)
+		// We use the default test certificates from Goproxy
+		mitmCa, err := tls.X509KeyPair(goproxy.CA_CERT, goproxy.CA_KEY)
+		r.NoError(err)
+		mitmCa.Leaf, err = x509.ParseCertificate(mitmCa.Certificate[0])
+		r.NoError(err)
+		cfg.MitmTLSConfig = goproxy.TLSConfigFromCA(&mitmCa)
+		r.NoError(err)
+		err = cfg.SetAllowAddresses([]string{"127.0.0.1"})
+		r.NoError(err)
+
+		clientCh := make(chan bool)
+		serverCh := make(chan bool)
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			serverCh <- true
+			<-serverCh
+			// This handlers returns a body with a string containing all the request headers it received.
+			var sb strings.Builder
+			for name, values := range r.Header {
+				for _, value := range values {
+					sb.WriteString(name)
+					sb.WriteString(": ")
+					sb.WriteString(value)
+					sb.WriteString(";")
+				}
+			}
+			io.WriteString(w, sb.String())
+			w.Write([]byte(sb.String()))
+		})
+
+		logHook := proxyLogHook(cfg)
+		l, err := net.Listen("tcp", "localhost:0")
+		r.NoError(err)
+		cfg.Listener = l
+
+		proxy := BuildProxy(cfg)
+		httpProxy := httptest.NewServer(proxy)
+		remote := httptest.NewTLSServer(h)
+		client, err := proxyClient(httpProxy.URL)
+		r.NoError(err)
+
+		req, err := http.NewRequest("GET", remote.URL, nil)
+		r.NoError(err)
+
+		go func() {
+			resp, err := client.Do(req)
+			r.NoError(err)
+			body, err := ioutil.ReadAll(resp.Body)
+			r.NoError(err)
+			resp.Body.Close()
+			// We check the response body to see if the Mitm-Header-Inject header was injected by the Mitm handler
+			a.Contains(string(body), "Accept-Language: el")
+			clientCh <- true
+		}()
+
+		<-serverCh
+		count := 0
+		cfg.ConnTracker.Range(func(k, v interface{}) bool {
+			count++
+			return true
+		})
+		a.Equal(1, count, "connTracker should contain one tracked connection")
+
+		serverCh <- true
+		<-clientCh
+
+		// Metrics should show one successful connection and a corresponding successful
+		// DNS request along with its timing metric.
+		tmc, ok := cfg.MetricsClient.(*metrics.MockMetricsClient)
+		r.True(ok)
+		i, err := tmc.GetCount("cn.atpt.total", map[string]string{"success": "true"})
+		r.NoError(err)
+		r.Equal(i, uint64(1))
+		lookups, err := tmc.GetCount("resolver.attempts_total", make(map[string]string))
+		r.NoError(err)
+		r.Equal(lookups, uint64(1))
+		ltime, err := tmc.GetCount("resolver.lookup_time", make(map[string]string))
+		r.NoError(err)
+		r.Equal(ltime, uint64(1))
+
+		proxyDecision := findCanonicalProxyDecision(logHook.AllEntries())
+		r.NotNil(proxyDecision)
+		r.Contains(proxyDecision.Data, "proxy_type")
+		r.Equal("connect", proxyDecision.Data["proxy_type"])
+		proxy.Tr.CloseIdleConnections()
+		// check proxyclose log entry has information about the request headers
+		proxyClose := findCanonicalProxyClose(logHook.AllEntries())
+		r.NotNil(proxyClose)
+		r.Equal("GET", proxyClose.Data["mitm_req_method"])
+		r.Contains(proxyClose.Data["mitm_req_url"], "https://127.0.0.1")
+		mitmReqHeaders, ok := proxyClose.Data["mitm_req_headers"].(http.Header)
+		r.True(ok)
+		r.Equal("[REDACTED]", mitmReqHeaders.Get("Accept-Language"))
+		r.Equal("Go-http-client/1.1", mitmReqHeaders.Get("User-Agent"))
+	})
+}
+
+func TestConfigValidate(t *testing.T) {
+	t.Run("Test invalid config", func(t *testing.T) {
+		conf := NewConfig()
+		conf.ConnectTimeout = 10 * time.Second
+		conf.ExitTimeout = 10 * time.Second
+		conf.AdditionalErrorMessageOnDeny = "Proxy denied"
+		conf.RejectResponseHandlerWithCtx = func(smokescreenContext *SmokescreenContext, response *http.Response) {
+			fmt.Println("RejectResponseHandlerWithCtx")
+		}
+		conf.RejectResponseHandler = func(response *http.Response) {
+			fmt.Println("RejectResponseHandler")
+		}
+		err := conf.Validate()
+		require.Error(t, err)
+
+	})
+
+	t.Run("Test valid config", func(t *testing.T) {
+		conf := NewConfig()
+		conf.ConnectTimeout = 10 * time.Second
+		conf.ExitTimeout = 10 * time.Second
+		conf.AdditionalErrorMessageOnDeny = "Proxy denied"
+
+		conf.RejectResponseHandler = func(response *http.Response) {
+			fmt.Println("RejectResponseHandler")
+		}
+		err := conf.Validate()
+		require.NoError(t, err)
+
 	})
 }
 
