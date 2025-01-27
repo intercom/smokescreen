@@ -186,7 +186,7 @@ func TestACLDecision(t *testing.T) {
 			a.NoError(err)
 			a.Equal(testCase.expectProject, proj)
 
-			d, err := acl.Decide(testCase.service, testCase.host, "")
+			d, err := acl.Decide(testCase.service, testCase.host)
 			a.NoError(err)
 			a.Equal(testCase.expectDecision, d.Result)
 			a.Equal(testCase.expectDecisionReason, d.Reason)
@@ -207,7 +207,7 @@ func TestACLUnknownServiceWithoutDefault(t *testing.T) {
 	a.Equal("no rule for service: unk", err.Error())
 	a.Empty(proj)
 
-	d, err := acl.Decide("unk", "example.com", "")
+	d, err := acl.Decide("unk", "example.com")
 	a.Equal(Deny, d.Result)
 	a.False(d.Default)
 	a.Nil(err)
@@ -357,56 +357,4 @@ func TestHostMatchesGlob(t *testing.T) {
 			)
 		})
 	}
-}
-
-func TestMitmComfig(t *testing.T) {
-	a := assert.New(t)
-
-	yl := NewYAMLLoader(path.Join("testdata", "mitm_config.yaml"))
-	acl, err := New(logrus.New(), yl, []string{})
-
-	a.NoError(err)
-	a.NotNil(acl)
-
-	mitmService := "enforce-dummy-mitm-srv"
-
-	proj, err := acl.Project(mitmService)
-	a.NoError(err)
-	a.Equal("usersec", proj)
-
-	d, err := acl.Decide(mitmService, "example-mitm.com", "")
-	a.NoError(err)
-	a.Equal(Allow, d.Result)
-	a.Equal("host matched allowed domain in rule", d.Reason)
-
-	a.NotNil(d.MitmConfig)
-	a.Equal(true, d.MitmConfig.DetailedHttpLogs)
-	a.Equal([]string{"User-Agent"}, d.MitmConfig.DetailedHttpLogsFullHeaders)
-	a.Equal(map[string]string{"Accept-Language": "el"}, d.MitmConfig.AddHeaders)
-}
-
-func TestInvalidMitmComfig(t *testing.T) {
-	a := assert.New(t)
-
-	acl := &ACL{
-		Rules: map[string]Rule{
-			"enforce-dummy-mitm-srv": {
-				Project: "usersec",
-				Policy:  Enforce,
-				DomainGlobs: []string{
-					"example.com",
-				},
-				MitmDomains: []MitmDomain{{
-					Domain: "example-mitm.com",
-					AddHeaders: map[string]string{
-						"Accept-Language": "el",
-					},
-					DetailedHttpLogs: true,
-				}},
-			},
-		},
-	}
-
-	err := acl.Validate()
-	a.Error(err)
 }

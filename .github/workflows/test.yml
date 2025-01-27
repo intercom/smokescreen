@@ -1,19 +1,14 @@
 on: [push, pull_request]
 name: Test
-# Workaround for coveralls error "Can't add a job to a build that is already closed"
-# See https://github.com/lemurheavy/coveralls-public/issues/1716
-env:
-  COVERALLS_SERVICE_NUMBER: ${{ github.run_id }}-${{ github.run_attempt }}
-  COVERALLS_PARALLEL: true
 jobs:
   test:
     strategy:
       matrix:
-        go-version: ['1.21', '1.22', '1.23']
+        go-version: ['1.19', '1.20']
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/checkout@v3
+    - uses: actions/setup-go@v3
       with:
         go-version: ${{ matrix.go-version }}
     - name: Setup env
@@ -28,24 +23,13 @@ jobs:
         go test -race -v -timeout 2m -failfast -covermode atomic -coverprofile=.covprofile ./... -tags=nointegration
         # Run integration tests hermetically to avoid nondeterministic races on environment variables
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestSmokescreenIntegration
-        go test -race -v -timeout 2m -failfast ./cmd/... -run TestInvalidUpstreamProxyConfiguratedFromEnv
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestInvalidUpstreamProxyConfiguration
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestClientHalfCloseConnection
-    # - name: Install goveralls
-    #   run: go install github.com/mattn/goveralls@latest
-    # - name: Send coverage
-    #   env:
-    #     COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    #   run: goveralls -coverprofile=.covprofile -service=github
-  finish:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-      # - name: Install goveralls
-      #   run: go install github.com/mattn/goveralls@latest
-      # - name: Close goveralls parallel build
-      #   env:
-      #     COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   run: goveralls -coverprofile=.covprofile -service=github -parallel-finish=true
+    - name: Install goveralls
+      env:
+        GO111MODULE: off
+      run: go get github.com/mattn/goveralls
+    - name: Send coverage
+      env:
+        COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: goveralls -coverprofile=.covprofile -service=github
