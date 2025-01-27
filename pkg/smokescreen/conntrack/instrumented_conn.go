@@ -2,7 +2,6 @@ package conntrack
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,7 +17,6 @@ const (
 	LogFieldDuration        = "duration"
 	LogFieldError           = "error"
 	LogFieldLastActivity    = "last_activity"
-	LogFieldOutboundAddr    = "outbound_remote_addr"
 	CanonicalProxyConnClose = "CANONICAL-PROXY-CN-CLOSE"
 )
 
@@ -93,8 +91,8 @@ func (ic *InstrumentedConn) Close() error {
 	end := time.Now()
 	duration := end.Sub(ic.Start).Seconds()
 
-	tags := []string{
-		fmt.Sprintf("role:%s", ic.Role),
+	tags := map[string]string{
+		"role": ic.Role,
 	}
 
 	ic.tracker.statsc.IncrWithTags("cn.close", tags, 1)
@@ -115,11 +113,6 @@ func (ic *InstrumentedConn) Close() error {
 		errorMessage = ic.ConnError.Error()
 	}
 
-	var outboundAddr string
-	if ic.RemoteAddr() != nil {
-		outboundAddr = ic.RemoteAddr().String()
-	}
-
 	ic.logger.WithFields(logrus.Fields{
 		LogFieldBytesIn:      ic.BytesIn,
 		LogFieldBytesOut:     ic.BytesOut,
@@ -127,7 +120,6 @@ func (ic *InstrumentedConn) Close() error {
 		LogFieldDuration:     duration,
 		LogFieldError:        errorMessage,
 		LogFieldLastActivity: time.Unix(0, atomic.LoadInt64(ic.LastActivity)).UTC(),
-		LogFieldOutboundAddr: outboundAddr,
 	}).Info(CanonicalProxyConnClose)
 
 	ic.tracker.Wg().Done()

@@ -2,8 +2,10 @@ package goproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -32,17 +34,19 @@ const (
 )
 
 var (
-	OkConnect       = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	MitmConnect     = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	HTTPMitmConnect = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	RejectConnect   = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	httpsRegexp     = regexp.MustCompile(`^https:\/\/`)
+	OkConnect                     = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	MitmConnect                   = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	HTTPMitmConnect               = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	RejectConnect                 = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	httpsRegexp                   = regexp.MustCompile(`^https:\/\/`)
+	PerRequestHTTPSProxyHeaderKey = "X-Upstream-Https-Proxy"
 )
 
 type ConnectAction struct {
-	Action    ConnectActionLiteral
-	Hijack    func(req *http.Request, client net.Conn, ctx *ProxyCtx)
-	TLSConfig func(host string, ctx *ProxyCtx) (*tls.Config, error)
+	Action            ConnectActionLiteral
+	Hijack            func(req *http.Request, client net.Conn, ctx *ProxyCtx)
+	TLSConfig         func(host string, ctx *ProxyCtx) (*tls.Config, error)
+	MitmMutateRequest func(req *http.Request, ctx *ProxyCtx)
 }
 
 func stripPort(s string) string {
@@ -83,8 +87,8 @@ func (proxy *ProxyHttpServer) connectDialContext(ctx *ProxyCtx, network, addr st
 }
 
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
-	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
 
+	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
 	hij, ok := w.(http.Hijacker)
 	if !ok {
 		panic("httpserver does not support hijacking")
@@ -111,22 +115,28 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			break
 		}
 	}
+	ctx.ConnectAction = todo.Action
 	switch todo.Action {
 	case ConnectAccept:
 		if !hasPort.MatchString(host) {
 			host += ":80"
 		}
 
-		httpsProxy, err := httpsProxyFromEnv(r.URL)
+		var httpsProxyString string = proxy.HttpsProxyAddr
+		if r.Header.Get(PerRequestHTTPSProxyHeaderKey) != "" {
+			httpsProxyString = r.Header.Get(PerRequestHTTPSProxyHeaderKey)
+		}
+
+		httpsProxyString, err := httpsProxyAddr(r.URL, httpsProxyString)
 		if err != nil {
 			ctx.Warnf("Error configuring HTTPS proxy err=%q url=%q", err, r.URL.String())
 		}
 
 		var targetSiteCon net.Conn
-		if httpsProxy == "" {
+		if httpsProxyString == "" {
 			targetSiteCon, err = proxy.connectDialContext(ctx, "tcp", host)
 		} else {
-			targetSiteCon, err = proxy.connectDialProxyWithContext(ctx, httpsProxy, host)
+			targetSiteCon, err = proxy.connectDialProxyWithContext(ctx, httpsProxyString, host)
 		}
 		if err != nil {
 			httpError(proxyClient, ctx, err)
@@ -134,7 +144,18 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		}
 
 		ctx.Logf("Accepting CONNECT to %s", host)
-		proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+		respBytes, err := createCustomConnectResponse(ctx)
+		if respBytes != nil {
+			// Write the custom response, if one was created
+			proxyClient.Write(respBytes)
+		} else {
+			// Otherwise, log any errors and fallback to the default response
+			if err != nil {
+				ctx.Warnf("Error writing custom CONNECT response: %s", err.Error())
+				return
+			}
+			proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+		}
 
 		if proxy.ConnectCopyHandler != nil {
 			go proxy.ConnectCopyHandler(ctx, proxyClient, targetSiteCon)
@@ -245,7 +266,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				req, err := http.ReadRequest(clientTlsReader)
 				// Set the RoundTripper on the ProxyCtx within the `HandleConnect` action of goproxy, then
 				// inject the roundtripper here in order to use a custom round tripper while mitm.
-				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy, UserData: ctx.UserData, RoundTripper: ctx.RoundTripper}
+				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy, UserData: ctx.UserData, RoundTripper: ctx.RoundTripper, ConnectAction: ctx.ConnectAction}
 				if err != nil && err != io.EOF {
 					return
 				}
@@ -254,6 +275,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					return
 				}
 				req.RemoteAddr = r.RemoteAddr // since we're converting the request, need to carry over the original connecting IP as well
+				if todo.MitmMutateRequest != nil {
+					todo.MitmMutateRequest(req, ctx)
+				}
 				ctx.Logf("req %v", r.Host)
 
 				if !httpsRegexp.MatchString(req.URL.String()) {
@@ -334,6 +358,22 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 	}
 }
 
+func createCustomConnectResponse(ctx *ProxyCtx) ([]byte, error) {
+	if ctx.proxy.ConnectRespHandler == nil {
+		return nil, nil
+	}
+	resp := &http.Response{Status: "200 OK", StatusCode: 200, Proto: "HTTP/1.0", ProtoMajor: 1, ProtoMinor: 0, ContentLength: -1, Header: http.Header{}}
+	err := ctx.proxy.ConnectRespHandler(ctx, resp)
+	if err != nil {
+		return nil, err
+	}
+	buf := &bytes.Buffer{}
+	if err := resp.Write(buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func httpError(w io.WriteCloser, ctx *ProxyCtx, err error) {
 	if ctx.HTTPErrorHandler != nil {
 		ctx.HTTPErrorHandler(w, ctx, err)
@@ -370,14 +410,20 @@ func copyAndClose(ctx *ProxyCtx, dst, src *net.TCPConn) {
 	src.CloseRead()
 }
 
-func dialerFromEnv(proxy *ProxyHttpServer) func(network, addr string) (net.Conn, error) {
-	https_proxy := os.Getenv("HTTPS_PROXY")
+// dialerFromProxy gets the HttpsProxyAddr from proxy to create a dialer.
+// When the HttpsProxyAddr from proxy is empty, use the HTTPS_PROXY, https_proxy from environment variables.
+func dialerFromProxy(proxy *ProxyHttpServer) func(network, addr string) (net.Conn, error) {
+	https_proxy := proxy.HttpsProxyAddr
 	if https_proxy == "" {
-		https_proxy = os.Getenv("https_proxy")
+		https_proxy = os.Getenv("HTTPS_PROXY")
+		if https_proxy == "" {
+			https_proxy = os.Getenv("https_proxy")
+		}
+		if https_proxy == "" {
+			return nil
+		}
 	}
-	if https_proxy == "" {
-		return nil
-	}
+
 	return proxy.NewConnectDialToProxy(https_proxy)
 }
 
@@ -503,11 +549,21 @@ func (proxy *ProxyHttpServer) connectDialProxyWithContext(ctx *ProxyCtx, proxyHo
 		c = tls.Client(c, proxy.Tr.TLSClientConfig)
 	}
 
+	connectRequestHeaders := make(http.Header)
+
+	// Add authentication header if needed to the CONNECT request to the proxy
+	user := proxyURL.User
+	if user != nil {
+		if auth := user.String(); auth != "" {
+			connectRequestHeaders.Add("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+		}
+	}
+
 	connectReq := &http.Request{
 		Method: "CONNECT",
 		URL:    &url.URL{Opaque: host},
 		Host:   host,
-		Header: make(http.Header),
+		Header: connectRequestHeaders,
 	}
 	connectReq.Write(c)
 	// Read response.
@@ -531,10 +587,17 @@ func (proxy *ProxyHttpServer) connectDialProxyWithContext(ctx *ProxyCtx, proxyHo
 	return c, nil
 }
 
-// httpsProxyFromEnv allows goproxy to respect no_proxy env vars
+// httpsProxyAddr function uses the address in httpsProxy parameter.
+// When the httpProxyAddr parameter is empty, uses the HTTPS_PROXY, https_proxy from environment variables.
+// httpsProxyAddr function allows goproxy to respect no_proxy env vars
 // https://github.com/stripe/goproxy/pull/5
-func httpsProxyFromEnv(reqURL *url.URL) (string, error) {
+func httpsProxyAddr(reqURL *url.URL, httpsProxy string) (string, error) {
 	cfg := httpproxy.FromEnvironment()
+
+	if httpsProxy != "" {
+		cfg.HTTPSProxy = httpsProxy
+	}
+
 	// We only use this codepath for HTTPS CONNECT proxies so we shouldn't
 	// return anything from HTTPProxy
 	cfg.HTTPProxy = ""
@@ -558,5 +621,10 @@ func httpsProxyFromEnv(reqURL *url.URL) (string, error) {
 		service = proxyURL.Scheme
 	}
 
-	return fmt.Sprintf("%s://%s:%s", proxyURL.Scheme, proxyURL.Hostname(), service), nil
+	hostname := proxyURL.Hostname()
+	if proxyURL.User != nil && proxyURL.User.String() != "" {
+		hostname = proxyURL.User.String() + "@" + hostname
+	}
+
+	return fmt.Sprintf("%s://%s:%s", proxyURL.Scheme, hostname, service), nil
 }

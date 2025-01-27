@@ -19,6 +19,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/stripe/goproxy"
 	acl "github.com/stripe/smokescreen/pkg/smokescreen/acl/v1"
 	"github.com/stripe/smokescreen/pkg/smokescreen/conntrack"
 	"github.com/stripe/smokescreen/pkg/smokescreen/metrics"
@@ -29,13 +30,20 @@ type RuleRange struct {
 	Port int
 }
 
+// Resolver implements the interface needed by smokescreen and implemented by *net.Resolver
+// This will allow different resolvers to also be provided
+type Resolver interface {
+	LookupPort(ctx context.Context, network, service string) (port int, err error)
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
 type Config struct {
 	Ip                           string
 	Port                         uint16
 	Listener                     net.Listener
 	DenyRanges                   []RuleRange
 	AllowRanges                  []RuleRange
-	Resolver                     *net.Resolver
+	Resolver                     Resolver
 	ConnectTimeout               time.Duration
 	ExitTimeout                  time.Duration
 	MetricsClient                metrics.MetricsClientInterface
@@ -66,14 +74,26 @@ type Config struct {
 	TransportMaxIdleConns        int
 	TransportMaxIdleConnsPerHost int
 
+	// These are the http and https address for the upstream proxy
+	UpstreamHttpProxyAddr  string
+	UpstreamHttpsProxyAddr string
+
 	// Used for logging connection time
 	TimeConnect bool
 
 	// Custom Dial Timeout function to be called
 	ProxyDialTimeout func(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error)
 
-	// Customer handler to allow clients to modify reject responses
+	// Custom handler to allow clients to modify reject responses
+	// Deprecated: RejectResponseHandler is deprecated.Please use RejectResponseHandlerWithCtx instead.
 	RejectResponseHandler func(*http.Response)
+
+	// Custom handler to allow clients to modify reject responses
+	// In case RejectResponseHandler is set, this cannot be used.
+	RejectResponseHandlerWithCtx func(*SmokescreenContext, *http.Response)
+
+	// Custom handler to allow clients to modify successful CONNECT responses
+	AcceptResponseHandler func(*SmokescreenContext, *http.Response) error
 
 	// UnsafeAllowPrivateRanges inverts the default behavior, telling smokescreen to allow private IP
 	// ranges by default (exempting loopback and unicast ranges)
@@ -82,8 +102,11 @@ type Config struct {
 
 	// Custom handler for users to allow running code per requests, users can pass in custom methods to verify requests based
 	// on headers, code for metrics etc.
+	// If smokescreen denies a request, this handler is not called.
 	// If the handler returns an error, smokescreen will deny the request.
-	CustomRequestHandler func(*http.Request) error
+	PostDecisionRequestHandler func(*http.Request) error
+	// MitmCa is used to provide a custom CA for MITM
+	MitmTLSConfig func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error)
 }
 
 type missingRoleError struct {
@@ -228,6 +251,7 @@ func NewConfig() *Config {
 	})
 
 	return &Config{
+		Resolver:                &net.Resolver{},
 		CrlByAuthorityKeyId:     make(map[string]*pkix.CertificateList),
 		clientCasBySubjectKeyId: make(map[string]*x509.Certificate),
 		Log:                     log.New(),
@@ -311,7 +335,7 @@ func (config *Config) SetupStatsdWithNamespace(addr, namespace string) error {
 		return nil
 	}
 
-	mc, err := metrics.NewMetricsClient(addr, namespace)
+	mc, err := metrics.NewStatsdMetricsClient(addr, namespace)
 	if err != nil {
 		return err
 	}
@@ -321,6 +345,15 @@ func (config *Config) SetupStatsdWithNamespace(addr, namespace string) error {
 
 func (config *Config) SetupStatsd(addr string) error {
 	return config.SetupStatsdWithNamespace(addr, DefaultStatsdNamespace)
+}
+
+func (config *Config) SetupPrometheus(endpoint string, port string, listenAddr string) error {
+	metricsClient, err := metrics.NewPrometheusMetricsClient(endpoint, port, listenAddr)
+	if err != nil {
+		return err
+	}
+	config.MetricsClient = metricsClient
+	return nil
 }
 
 func (config *Config) SetupEgressAcl(aclFile string) error {
@@ -387,6 +420,13 @@ func (config *Config) SetupTls(certFile, keyFile string, clientCAFiles []string)
 		ClientCAs:    clientCAs,
 	}
 
+	return nil
+}
+
+func (config *Config) Validate() error {
+	if config.RejectResponseHandler != nil && config.RejectResponseHandlerWithCtx != nil {
+		return errors.New("RejectResponseHandler and RejectResponseHandlerWithCtx cannot be used together")
+	}
 	return nil
 }
 
