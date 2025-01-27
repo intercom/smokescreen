@@ -31,21 +31,21 @@ jobs:
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestInvalidUpstreamProxyConfiguratedFromEnv
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestInvalidUpstreamProxyConfiguration
         go test -race -v -timeout 2m -failfast ./cmd/... -run TestClientHalfCloseConnection
-    - name: Install goveralls
-      run: go install github.com/mattn/goveralls@latest
-    - name: Send coverage
-      env:
-        COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: goveralls -coverprofile=.covprofile -service=github
+    # - name: Install goveralls
+    #   run: go install github.com/mattn/goveralls@latest
+    # - name: Send coverage
+    #   env:
+    #     COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #   run: goveralls -coverprofile=.covprofile -service=github
   finish:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-      - name: Install goveralls 
-        run: go install github.com/mattn/goveralls@latest
-      - name: Close goveralls parallel build 
-        env:
-          COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: goveralls -coverprofile=.covprofile -service=github -parallel-finish=true
+      # - name: Install goveralls
+      #   run: go install github.com/mattn/goveralls@latest
+      # - name: Close goveralls parallel build
+      #   env:
+      #     COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: goveralls -coverprofile=.covprofile -service=github -parallel-finish=true
